@@ -16,7 +16,7 @@ import mmap
 import json
 import pickle
 import gc
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
 import queue
@@ -32,6 +32,10 @@ from scipy.sparse import csr_matrix, save_npz, load_npz
 import lz4.frame
 import xxhash
 import math
+import inspect
+import types
+from functools import partial
+import warnings
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +59,7 @@ class ExactCircuit:
     output_shape: Tuple[int, ...]
     exact_hash: str
     memory_size: int
+    bias: Optional[Dict[str, torch.Tensor]] = field(default_factory=dict)
 
 @dataclass
 class ReasoningCache:
@@ -64,6 +69,7 @@ class ReasoningCache:
     verification_data: Dict[str, Any]
     total_memory: int
     exact_checksum: str
+    model_spec: Dict[str, Any] = field(default_factory=dict)
 
 class ExactMemoryManager:
     """Manages exact memory operations for large models"""
@@ -103,6 +109,16 @@ class ExactMemoryManager:
                 self.release_memory(size)
         else:
             raise MemoryError(f"Cannot allocate {size} bytes")
+            
+    def cleanup(self):
+        """Clean up temporary files"""
+        for file_path in self.temp_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file {file_path}: {e}")
+        self.temp_files = []
 
 class WeightLoader:
     """Efficient weight loading with memory mapping"""
@@ -110,6 +126,8 @@ class WeightLoader:
     def __init__(self, model_dir: Path):
         self.model_dir = Path(model_dir)
         self.files = list(self.model_dir.glob('*.safetensors'))
+        if not self.files:
+            self.files = list(self.model_dir.glob('*.bin'))
         self.files.sort(key=lambda x: x.name)
         
     def load_all_weights(self) -> Dict[str, torch.Tensor]:
@@ -118,7 +136,11 @@ class WeightLoader:
         
         for file_path in self.files:
             logger.info(f"Loading weights from {file_path}")
-            file_weights = load_file(str(file_path), device='cpu')
+            if file_path.suffix == '.safetensors':
+                file_weights = load_file(str(file_path), device='cpu')
+            else:
+                # Fallback to torch.load for .bin files
+                file_weights = torch.load(file_path, map_location='cpu', weights_only=True)
             weights.update(file_weights)
             
         return weights
@@ -129,7 +151,11 @@ class WeightLoader:
         layer_prefix = f"model.layers.{layer_idx}"
         
         for file_path in self.files:
-            file_weights = load_file(str(file_path))
+            if file_path.suffix == '.safetensors':
+                file_weights = load_file(str(file_path))
+            else:
+                file_weights = torch.load(file_path, map_location='cpu', weights_only=True)
+                
             for name, weight in file_weights.items():
                 if name.startswith(layer_prefix):
                     layer_weights[name] = weight
@@ -139,16 +165,18 @@ class WeightLoader:
     def stream_weights(self, callback, chunk_size: int = 1000):
         """Stream weights to avoid memory issues"""
         for file_path in self.files:
-            with open(file_path, 'rb') as f:
-                # Custom streaming implementation
+            if file_path.suffix == '.safetensors':
                 weights = load_file(str(file_path))
-                items = list(weights.items())
+            else:
+                weights = torch.load(file_path, map_location='cpu', weights_only=True)
                 
-                for i in range(0, len(items), chunk_size):
-                    chunk = dict(items[i:i+chunk_size])
-                    callback(chunk)
-                    del chunk
-                    gc.collect()
+            items = list(weights.items())
+            
+            for i in range(0, len(items), chunk_size):
+                chunk = dict(items[i:i+chunk_size])
+                callback(chunk)
+                del chunk
+                gc.collect()
 
 class ExactCircuitExtractor:
     """Extract exact reasoning circuits without approximation"""
@@ -177,6 +205,10 @@ class ExactCircuitExtractor:
         embed_circuits = self._extract_embedding_circuits(weights)
         circuits.update(embed_circuits)
         
+        logger.info("Extracting exact rotary embedding circuits...")
+        rotary_circuits = self._extract_rotary_circuits(weights)
+        circuits.update(rotary_circuits)
+        
         return circuits
     
     def _extract_attention_circuits(self, weights: Dict[str, torch.Tensor]) -> Dict[str, ExactCircuit]:
@@ -190,6 +222,12 @@ class ExactCircuitExtractor:
             v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
             o_key = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
             
+            # Check for biases
+            q_bias_key = f"model.layers.{layer_idx}.self_attn.q_proj.bias"
+            k_bias_key = f"model.layers.{layer_idx}.self_attn.k_proj.bias"
+            v_bias_key = f"model.layers.{layer_idx}.self_attn.v_proj.bias"
+            o_bias_key = f"model.layers.{layer_idx}.self_attn.o_proj.bias"
+            
             if all(key in weights for key in [q_key, k_key, v_key, o_key]):
                 circuit_weights = {
                     'q_proj': weights[q_key],
@@ -198,9 +236,16 @@ class ExactCircuitExtractor:
                     'o_proj': weights[o_key]
                 }
                 
+                # Add biases if they exist
+                bias_weights = {}
+                for bias_key in [q_bias_key, k_bias_key, v_bias_key, o_bias_key]:
+                    if bias_key in weights:
+                        bias_name = bias_key.split('.')[-2]  # e.g., 'q_proj'
+                        bias_weights[bias_name] = weights[bias_key]
+                
                 # Generate exact computation code
                 computation_code = self._generate_exact_attention_code(
-                    circuit_weights, layer_idx
+                    circuit_weights, layer_idx, bool(bias_weights)
                 )
                 
                 # Calculate exact hash
@@ -208,6 +253,7 @@ class ExactCircuitExtractor:
                 
                 # Memory size
                 memory_size = sum(w.numel() * w.element_size() for w in circuit_weights.values())
+                memory_size += sum(b.numel() * b.element_size() for b in bias_weights.values())
                 
                 circuit = ExactCircuit(
                     layer_idx=layer_idx,
@@ -217,7 +263,8 @@ class ExactCircuitExtractor:
                     input_shape=(None, None, self.spec['hidden_dim']),
                     output_shape=(None, None, self.spec['hidden_dim']),
                     exact_hash=exact_hash,
-                    memory_size=memory_size
+                    memory_size=memory_size,
+                    bias=bias_weights
                 )
                 
                 circuits[f'attention_{layer_idx}'] = circuit
@@ -233,6 +280,11 @@ class ExactCircuitExtractor:
             up_key = f"model.layers.{layer_idx}.mlp.up_proj.weight"
             down_key = f"model.layers.{layer_idx}.mlp.down_proj.weight"
             
+            # Check for biases
+            gate_bias_key = f"model.layers.{layer_idx}.mlp.gate_proj.bias"
+            up_bias_key = f"model.layers.{layer_idx}.mlp.up_proj.bias"
+            down_bias_key = f"model.layers.{layer_idx}.mlp.down_proj.bias"
+            
             if all(key in weights for key in [gate_key, up_key, down_key]):
                 circuit_weights = {
                     'gate_proj': weights[gate_key],
@@ -240,12 +292,20 @@ class ExactCircuitExtractor:
                     'down_proj': weights[down_key]
                 }
                 
+                # Add biases if they exist
+                bias_weights = {}
+                for bias_key in [gate_bias_key, up_bias_key, down_bias_key]:
+                    if bias_key in weights:
+                        bias_name = bias_key.split('.')[-2]  # e.g., 'gate_proj'
+                        bias_weights[bias_name] = weights[bias_key]
+                
                 computation_code = self._generate_exact_mlp_code(
-                    circuit_weights, layer_idx
+                    circuit_weights, layer_idx, bool(bias_weights)
                 )
                 
                 exact_hash = self._compute_exact_hash(circuit_weights)
                 memory_size = sum(w.numel() * w.element_size() for w in circuit_weights.values())
+                memory_size += sum(b.numel() * b.element_size() for b in bias_weights.values())
                 
                 circuit = ExactCircuit(
                     layer_idx=layer_idx,
@@ -255,7 +315,8 @@ class ExactCircuitExtractor:
                     input_shape=(None, None, self.spec['hidden_dim']),
                     output_shape=(None, None, self.spec['hidden_dim']),
                     exact_hash=exact_hash,
-                    memory_size=memory_size
+                    memory_size=memory_size,
+                    bias=bias_weights
                 )
                 
                 circuits[f'mlp_{layer_idx}'] = circuit
@@ -269,15 +330,24 @@ class ExactCircuitExtractor:
         for layer_idx in range(self.spec['layer_count']):
             # Input layer norm
             input_norm_key = f"model.layers.{layer_idx}.input_layernorm.weight"
+            input_norm_bias_key = f"model.layers.{layer_idx}.input_layernorm.bias"
+            
             if input_norm_key in weights:
                 circuit_weights = {'weight': weights[input_norm_key]}
                 
+                # Add bias if it exists
+                bias_weights = {}
+                if input_norm_bias_key in weights:
+                    bias_weights['bias'] = weights[input_norm_bias_key]
+                
                 computation_code = self._generate_exact_norm_code(
-                    circuit_weights, layer_idx, 'input'
+                    circuit_weights, layer_idx, 'input', bool(bias_weights)
                 )
                 
                 exact_hash = self._compute_exact_hash(circuit_weights)
                 memory_size = weights[input_norm_key].numel() * weights[input_norm_key].element_size()
+                if bias_weights:
+                    memory_size += weights[input_norm_bias_key].numel() * weights[input_norm_bias_key].element_size()
                 
                 circuit = ExactCircuit(
                     layer_idx=layer_idx,
@@ -287,22 +357,32 @@ class ExactCircuitExtractor:
                     input_shape=(None, None, self.spec['hidden_dim']),
                     output_shape=(None, None, self.spec['hidden_dim']),
                     exact_hash=exact_hash,
-                    memory_size=memory_size
+                    memory_size=memory_size,
+                    bias=bias_weights
                 )
                 
                 circuits[f'input_norm_{layer_idx}'] = circuit
             
             # Post-attention norm
             post_norm_key = f"model.layers.{layer_idx}.post_attention_layernorm.weight"
+            post_norm_bias_key = f"model.layers.{layer_idx}.post_attention_layernorm.bias"
+            
             if post_norm_key in weights:
                 circuit_weights = {'weight': weights[post_norm_key]}
                 
+                # Add bias if it exists
+                bias_weights = {}
+                if post_norm_bias_key in weights:
+                    bias_weights['bias'] = weights[post_norm_bias_key]
+                
                 computation_code = self._generate_exact_norm_code(
-                    circuit_weights, layer_idx, 'post'
+                    circuit_weights, layer_idx, 'post', bool(bias_weights)
                 )
                 
                 exact_hash = self._compute_exact_hash(circuit_weights)
                 memory_size = weights[post_norm_key].numel() * weights[post_norm_key].element_size()
+                if bias_weights:
+                    memory_size += weights[post_norm_bias_key].numel() * weights[post_norm_bias_key].element_size()
                 
                 circuit = ExactCircuit(
                     layer_idx=layer_idx,
@@ -312,7 +392,8 @@ class ExactCircuitExtractor:
                     input_shape=(None, None, self.spec['hidden_dim']),
                     output_shape=(None, None, self.spec['hidden_dim']),
                     exact_hash=exact_hash,
-                    memory_size=memory_size
+                    memory_size=memory_size,
+                    bias=bias_weights
                 )
                 
                 circuits[f'post_norm_{layer_idx}'] = circuit
@@ -348,13 +429,24 @@ class ExactCircuitExtractor:
         
         # Final layer norm
         final_norm_key = "model.norm.weight"
+        final_norm_bias_key = "model.norm.bias"
+        
         if final_norm_key in weights:
             circuit_weights = {'weight': weights[final_norm_key]}
             
-            computation_code = self._generate_exact_norm_code(circuit_weights, -1, 'final')
+            # Add bias if it exists
+            bias_weights = {}
+            if final_norm_bias_key in weights:
+                bias_weights['bias'] = weights[final_norm_bias_key]
+            
+            computation_code = self._generate_exact_norm_code(
+                circuit_weights, -1, 'final', bool(bias_weights)
+            )
             
             exact_hash = self._compute_exact_hash(circuit_weights)
             memory_size = weights[final_norm_key].numel() * weights[final_norm_key].element_size()
+            if bias_weights:
+                memory_size += weights[final_norm_bias_key].numel() * weights[final_norm_bias_key].element_size()
             
             circuit = ExactCircuit(
                 layer_idx=-1,
@@ -364,7 +456,8 @@ class ExactCircuitExtractor:
                 input_shape=(None, None, self.spec['hidden_dim']),
                 output_shape=(None, None, self.spec['hidden_dim']),
                 exact_hash=exact_hash,
-                memory_size=memory_size
+                memory_size=memory_size,
+                bias=bias_weights
             )
             
             circuits['final_norm'] = circuit
@@ -394,20 +487,56 @@ class ExactCircuitExtractor:
         
         return circuits
     
-    def _generate_exact_attention_code(self, weights: Dict[str, torch.Tensor], layer_idx: int) -> bytes:
+    def _extract_rotary_circuits(self, weights: Dict[str, torch.Tensor]) -> Dict[str, ExactCircuit]:
+        """Extract rotary positional embedding circuits if they exist"""
+        circuits = {}
+        
+        # Look for rotary embedding weights (common in models like LLaMA)
+        rotary_keys = [k for k in weights.keys() if 'rotary' in k.lower() or 'rope' in k.lower()]
+        
+        for key in rotary_keys:
+            circuit_weights = {'weight': weights[key]}
+            
+            computation_code = self._generate_exact_rotary_code(circuit_weights, key)
+            
+            exact_hash = self._compute_exact_hash(circuit_weights)
+            memory_size = weights[key].numel() * weights[key].element_size()
+            
+            circuit = ExactCircuit(
+                layer_idx=-1,  # Global
+                circuit_type='rotary_embedding',
+                weights=circuit_weights,
+                computation_code=computation_code,
+                input_shape=(None, None, self.spec['hidden_dim']),
+                output_shape=(None, None, self.spec['hidden_dim']),
+                exact_hash=exact_hash,
+                memory_size=memory_size
+            )
+            
+            circuits[f'rotary_{key}'] = circuit
+        
+        return circuits
+    
+    def _generate_exact_attention_code(self, weights: Dict[str, torch.Tensor], layer_idx: int, has_bias: bool) -> bytes:
         """Generate exact attention computation code"""
         
-        # Store weight shapes for reconstruction
-        q_shape = list(weights['q_proj'].shape)
-        k_shape = list(weights['k_proj'].shape)
-        v_shape = list(weights['v_proj'].shape)
-        o_shape = list(weights['o_proj'].shape)
+        bias_code = ""
+        if has_bias:
+            bias_code = """
+    # Add biases if they exist
+    if 'q_proj' in bias_weights:
+        query = query + bias_weights['q_proj']
+    if 'k_proj' in bias_weights:
+        key = key + bias_weights['k_proj']
+    if 'v_proj' in bias_weights:
+        value = value + bias_weights['v_proj']
+            """
         
         code = f"""
 import torch
 import math
 
-def exact_attention_{layer_idx}(hidden_states, attention_mask=None, past_key_values=None):
+def exact_attention_{layer_idx}(hidden_states, attention_mask=None, past_key_values=None, position_ids=None, bias_weights=None):
     batch_size, seq_len, hidden_size = hidden_states.shape
     num_heads = {self.spec.get('num_heads', 32)}
     head_dim = hidden_size // num_heads
@@ -423,10 +552,18 @@ def exact_attention_{layer_idx}(hidden_states, attention_mask=None, past_key_val
     key = torch.matmul(hidden_states, k_weight.T)
     value = torch.matmul(hidden_states, v_weight.T)
     
+    {bias_code}
+    
     # Reshape for multi-head
     query = query.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
     key = key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
     value = value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    
+    # Apply rotary positional embeddings if available
+    if hasattr(torch, 'apply_rotary_pos_emb') and position_ids is not None:
+        cos, sin = get_rotary_embeddings(seq_len, head_dim, device=hidden_states.device)
+        query = torch.apply_rotary_pos_emb(query, cos, sin, position_ids)
+        key = torch.apply_rotary_pos_emb(key, cos, sin, position_ids)
     
     # Handle past key values
     if past_key_values is not None:
@@ -438,7 +575,7 @@ def exact_attention_{layer_idx}(hidden_states, attention_mask=None, past_key_val
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
     
     if attention_mask is not None:
-        scores += attention_mask
+        scores = scores + attention_mask
     
     attn_weights = torch.softmax(scores, dim=-1)
     attn_output = torch.matmul(attn_weights, value)
@@ -449,18 +586,32 @@ def exact_attention_{layer_idx}(hidden_states, attention_mask=None, past_key_val
     )
     output = torch.matmul(attn_output, o_weight.T)
     
+    # Add output bias if it exists
+    if bias_weights is not None and 'o_proj' in bias_weights:
+        output = output + bias_weights['o_proj']
+    
     return output, (key, value)
         """.encode()
         
         return code
     
-    def _generate_exact_mlp_code(self, weights: Dict[str, torch.Tensor], layer_idx: int) -> bytes:
+    def _generate_exact_mlp_code(self, weights: Dict[str, torch.Tensor], layer_idx: int, has_bias: bool) -> bytes:
         """Generate exact MLP computation code"""
+        
+        bias_code = ""
+        if has_bias:
+            bias_code = """
+    # Add biases if they exist
+    if 'gate_proj' in bias_weights:
+        gate = gate + bias_weights['gate_proj']
+    if 'up_proj' in bias_weights:
+        up = up + bias_weights['up_proj']
+    """
         
         code = f"""
 import torch
 
-def exact_mlp_{layer_idx}(hidden_states):
+def exact_mlp_{layer_idx}(hidden_states, bias_weights=None):
     # Weight placeholders - replaced at runtime
     gate_weight = WEIGHT_PLACEHOLDER_gate_proj
     up_weight = WEIGHT_PLACEHOLDER_up_proj
@@ -468,6 +619,7 @@ def exact_mlp_{layer_idx}(hidden_states):
     
     # Gate projection with SiLU activation
     gate = torch.matmul(hidden_states, gate_weight.T)
+    {bias_code}
     gate = torch.nn.functional.silu(gate)
     
     # Up projection
@@ -479,18 +631,30 @@ def exact_mlp_{layer_idx}(hidden_states):
     # Down projection
     output = torch.matmul(intermediate, down_weight.T)
     
+    # Add down bias if it exists
+    if bias_weights is not None and 'down_proj' in bias_weights:
+        output = output + bias_weights['down_proj']
+    
     return output
         """.encode()
         
         return code
     
-    def _generate_exact_norm_code(self, weights: Dict[str, torch.Tensor], layer_idx: int, norm_type: str) -> bytes:
+    def _generate_exact_norm_code(self, weights: Dict[str, torch.Tensor], layer_idx: int, norm_type: str, has_bias: bool) -> bytes:
         """Generate exact layer normalization code"""
+        
+        bias_code = ""
+        if has_bias:
+            bias_code = """
+    # Add bias if it exists
+    if bias_weights is not None and 'bias' in bias_weights:
+        normalized = normalized + bias_weights['bias']
+    """
         
         code = f"""
 import torch
 
-def exact_norm_{layer_idx}_{norm_type}(hidden_states):
+def exact_norm_{layer_idx}_{norm_type}(hidden_states, bias_weights=None):
     # Weight placeholder
     weight = WEIGHT_PLACEHOLDER_weight
     
@@ -499,7 +663,12 @@ def exact_norm_{layer_idx}_{norm_type}(hidden_states):
     var = hidden_states.var(dim=-1, keepdim=True, unbiased=False)
     normalized = (hidden_states - mean) / torch.sqrt(var + 1e-5)
     
-    return weight * normalized
+    # Apply weight
+    normalized = weight * normalized
+    
+    {bias_code}
+    
+    return normalized
         """.encode()
         
         return code
@@ -532,6 +701,43 @@ def exact_lm_head(hidden_states):
         
         return code
     
+    def _generate_exact_rotary_code(self, weights: Dict[str, torch.Tensor], key: str) -> bytes:
+        """Generate exact rotary positional embedding code"""
+        
+        code = f"""
+import torch
+import math
+
+def get_rotary_embeddings(seq_len, dim, device='cpu', base=10000.0):
+    # Generate rotary positional embeddings
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    t = torch.arange(seq_len, dtype=torch.float32, device=device)
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    return cos, sin
+
+def apply_rotary_pos_emb(x, cos, sin, position_ids=None):
+    # Apply rotary positional embeddings to input tensor
+    if position_ids is None:
+        position_ids = torch.arange(x.shape[-2], dtype=torch.long, device=x.device)
+    
+    cos = cos[position_ids].unsqueeze(1)  # [seq_len, dim] -> [batch, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(1)
+    
+    x_embed = (x * cos) + (rotate_half(x) * sin)
+    return x_embed
+
+def rotate_half(x):
+    # Rotate half the hidden dims of the input
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+        """.encode()
+        
+        return code
+    
     def _compute_exact_hash(self, weights: Dict[str, torch.Tensor]) -> str:
         """Compute exact hash of weights for verification"""
         
@@ -545,7 +751,7 @@ def exact_lm_head(hidden_states):
         
         combined_data = np.concatenate(all_data)
         data_bytes = combined_data.tobytes()
-        return xxhash.xxh64(data_bytes).hexdigest()
+        return xxhash.xxh3_64(data_bytes).hexdigest()
 
 class ExactTransferEngine:
     """Engine for exact 1:1 reasoning transfer"""
@@ -578,7 +784,8 @@ class ExactTransferEngine:
             computation_graph=computation_graph,
             verification_data=verification_data,
             total_memory=total_memory,
-            exact_checksum=exact_checksum
+            exact_checksum=exact_checksum,
+            model_spec=target_spec
         )
         
         return reasoning_cache
@@ -618,6 +825,13 @@ class ExactTransferEngine:
         if 'lm_head' in circuits:
             graph['lm_head'] = []
         
+        # Add rotary embeddings to the graph if they exist
+        rotary_keys = [k for k in circuits.keys() if k.startswith('rotary_')]
+        if rotary_keys:
+            # Rotary embeddings are used by attention layers
+            for rotary_key in rotary_keys:
+                graph[rotary_key] = [f'attention_{i}' for i in range(layer_count) if f'attention_{i}' in circuits]
+        
         return graph
     
     def _create_verification_data(self, circuits: Dict[str, ExactCircuit], spec: Dict) -> Dict[str, Any]:
@@ -628,7 +842,8 @@ class ExactTransferEngine:
             'total_circuits': len(circuits),
             'total_parameters': sum(circuit.memory_size for circuit in circuits.values()) // 4,
             'verification_vectors': self._generate_verification_vectors(spec),
-            'spec_checksum': self._compute_spec_checksum(spec)
+            'spec_checksum': self._compute_spec_checksum(spec),
+            'verification_timestamp': time.time()
         }
         
         return verification
@@ -651,14 +866,14 @@ class ExactTransferEngine:
     def _compute_spec_checksum(self, spec: Dict) -> str:
         """Compute checksum of model specification"""
         spec_str = json.dumps(spec, sort_keys=True)
-        return xxhash.xxh64(spec_str.encode()).hexdigest()
+        return xxhash.xxh3_64(spec_str.encode()).hexdigest()
     
     def _compute_cache_checksum(self, circuits: Dict[str, ExactCircuit]) -> str:
         """Compute exact checksum of entire cache"""
         
         all_hashes = [circuit.exact_hash for circuit in circuits.values()]
         combined = ''.join(sorted(all_hashes))
-        return xxhash.xxh64(combined.encode()).hexdigest()
+        return xxhash.xxh3_64(combined.encode()).hexdigest()
 
 class ExactRuntimeEngine:
     """Runtime engine for exact 1:1 reasoning execution"""
@@ -668,6 +883,7 @@ class ExactRuntimeEngine:
         self.compiled_functions = {}
         self.execution_order = self._determine_execution_order()
         self.weight_cache = {}
+        self.bias_cache = {}
         
     def _determine_execution_order(self) -> List[str]:
         """Determine exact execution order using topological sort"""
@@ -688,14 +904,15 @@ class ExactRuntimeEngine:
                 order.append(node)
         
         # Start from embedding or first available node
-        start_nodes = ['embedding']
+        start_nodes = ['embedding'] + [k for k in self.cache.circuits.keys() if k.startswith('rotary_')]
         for node in start_nodes:
             if node in self.cache.circuits:
                 visit(node)
         
         # Visit any remaining nodes
         for node in self.cache.circuits:
-            visit(node)
+            if node not in visited:
+                visit(node)
         
         return order
     
@@ -720,6 +937,22 @@ class ExactRuntimeEngine:
                         placeholder, 
                         f"runtime_engine.weight_cache['{weight_key}']"
                     )
+                
+                # Store biases if they exist
+                if circuit.bias:
+                    bias_key = f"{name}_bias"
+                    self.bias_cache[bias_key] = circuit.bias
+                    # Add bias parameter to function calls
+                    if 'attention' in circuit.circuit_type:
+                        code_str = code_str.replace(
+                            "bias_weights=None", 
+                            f"bias_weights=runtime_engine.bias_cache.get('{bias_key}', None)"
+                        )
+                    elif 'mlp' in circuit.circuit_type or 'norm' in circuit.circuit_type:
+                        code_str = code_str.replace(
+                            "bias_weights=None", 
+                            f"bias_weights=runtime_engine.bias_cache.get('{bias_key}', None)"
+                        )
                 
                 # Compile the function
                 local_vars = {'runtime_engine': self}
@@ -749,7 +982,8 @@ class ExactRuntimeEngine:
         logger.info(f"Compiled {len(self.compiled_functions)} exact functions")
     
     def forward_exact(self, input_ids: torch.Tensor, 
-                     attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     attention_mask: Optional[torch.Tensor] = None,
+                     position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Execute exact 1:1 forward pass using transferred reasoning"""
         
         if not self.compiled_functions:
@@ -775,7 +1009,7 @@ class ExactRuntimeEngine:
                     if node in self.compiled_functions and hidden_states is not None:
                         past_kv = past_key_values_cache.get(layer_idx, None)
                         result = self.compiled_functions[node](
-                            hidden_states, attention_mask, past_kv
+                            hidden_states, attention_mask, past_kv, position_ids
                         )
                         if isinstance(result, tuple):
                             hidden_states, past_key_values_cache[layer_idx] = result
@@ -797,6 +1031,10 @@ class ExactRuntimeEngine:
                 elif node == 'lm_head':
                     if 'lm_head' in self.compiled_functions and hidden_states is not None:
                         hidden_states = self.compiled_functions['lm_head'](hidden_states)
+                
+                elif node.startswith('rotary_'):
+                    # Rotary embeddings are handled within attention
+                    pass
                 
             except Exception as e:
                 logger.error(f"Error executing {node}: {e}")
@@ -850,10 +1088,12 @@ class ExactRuntimeEngine:
             _ = self.forward_exact(test_input)
         
         # Benchmark
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
         times = []
         for _ in range(num_runs):
             start_time = time.time()
             _ = self.forward_exact(test_input)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
             end_time = time.time()
             times.append(end_time - start_time)
         
@@ -903,8 +1143,8 @@ class StudentModelAdapter:
                 self.adapter = adapter_self
                 self.runtime = ExactRuntimeEngine(adapter_self.reasoning_cache)
                 
-            def forward(self, input_ids, attention_mask=None):
-                return self.adapter.runtime.forward_exact(input_ids, attention_mask)
+            def forward(self, input_ids, attention_mask=None, position_ids=None):
+                return self.runtime.forward_exact(input_ids, attention_mask, position_ids)
         
         return AdaptedStudentModel(self)
 
@@ -966,7 +1206,8 @@ class CompleteChimera:
             'total_memory': reasoning_cache.total_memory,
             'exact_checksum': reasoning_cache.exact_checksum,
             'circuit_types': list(set(c.circuit_type for c in reasoning_cache.circuits.values())),
-            'created_timestamp': time.time()
+            'created_timestamp': time.time(),
+            'model_spec': reasoning_cache.model_spec
         }
         
         with open(metadata_path, 'w') as f:
@@ -1011,7 +1252,8 @@ class CompleteChimera:
             'computation_graph': cache.computation_graph,
             'verification_data': cache.verification_data,
             'total_memory': cache.total_memory,
-            'exact_checksum': cache.exact_checksum
+            'exact_checksum': cache.exact_checksum,
+            'model_spec': cache.model_spec
         }
         
         for name, circuit in cache.circuits.items():
@@ -1023,10 +1265,19 @@ class CompleteChimera:
                 else:
                     cpu_weights[k] = v
             
+            # Convert biases
+            cpu_biases = {}
+            for k, v in circuit.bias.items():
+                if isinstance(v, torch.Tensor):
+                    cpu_biases[k] = v.detach().cpu().numpy().tolist()
+                else:
+                    cpu_biases[k] = v
+            
             serializable_circuit = {
                 'layer_idx': circuit.layer_idx,
                 'circuit_type': circuit.circuit_type,
                 'weights': cpu_weights,
+                'bias': cpu_biases,
                 'computation_code': circuit.computation_code.decode('utf-8'),
                 'input_shape': circuit.input_shape,
                 'output_shape': circuit.output_shape,
@@ -1053,6 +1304,14 @@ class CompleteChimera:
                 else:
                     weights[k] = v
             
+            # Convert bias lists back to tensors
+            biases = {}
+            for k, v in circuit_data.get('bias', {}).items():
+                if isinstance(v, list):
+                    biases[k] = torch.tensor(v, dtype=torch.float32)
+                else:
+                    biases[k] = v
+            
             circuit = ExactCircuit(
                 layer_idx=circuit_data['layer_idx'],
                 circuit_type=circuit_data['circuit_type'],
@@ -1061,7 +1320,8 @@ class CompleteChimera:
                 input_shape=tuple(circuit_data['input_shape']),
                 output_shape=tuple(circuit_data['output_shape']),
                 exact_hash=circuit_data['exact_hash'],
-                memory_size=circuit_data['memory_size']
+                memory_size=circuit_data['memory_size'],
+                bias=biases
             )
             circuits[name] = circuit
         
@@ -1070,7 +1330,8 @@ class CompleteChimera:
             computation_graph=serialized_data['computation_graph'],
             verification_data=serialized_data['verification_data'],
             total_memory=serialized_data['total_memory'],
-            exact_checksum=serialized_data['exact_checksum']
+            exact_checksum=serialized_data['exact_checksum'],
+            model_spec=serialized_data.get('model_spec', {})
         )
     
     def _recompute_checksum(self, cache: ReasoningCache) -> str:
@@ -1078,7 +1339,7 @@ class CompleteChimera:
         
         all_hashes = [circuit.exact_hash for circuit in cache.circuits.values()]
         combined = ''.join(sorted(all_hashes))
-        return xxhash.xxh64(combined.encode()).hexdigest()
+        return xxhash.xxh3_64(combined.encode()).hexdigest()
     
     def create_student_model(self, reasoning_cache: ReasoningCache, 
                            student_spec: Dict) -> torch.nn.Module:
@@ -1126,6 +1387,10 @@ class CompleteChimera:
         logger.info("Transfer quality validation completed")
         
         return metrics
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.memory_manager.cleanup()
 
 
 # Example usage and testing functions
@@ -1172,6 +1437,8 @@ def run_example_pipeline():
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
         raise
+    finally:
+        chimera.cleanup()
 
 if __name__ == "__main__":
     # Run example
