@@ -8,7 +8,7 @@ Every function fully implemented, every optimization included
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional, Union
+from typing import Dict, List, Tuple, Any, Optional, Union, Callable
 from pathlib import Path
 import hashlib
 import struct
@@ -36,6 +36,8 @@ import inspect
 import types
 from functools import partial
 import warnings
+import tempfile
+from enum import Enum
 
 # Configure logging
 logging.basicConfig(
@@ -47,6 +49,17 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class CircuitType(Enum):
+    """Types of reasoning circuits"""
+    ATTENTION = "attention"
+    MLP = "mlp"
+    INPUT_NORM = "input_norm"
+    POST_NORM = "post_norm"
+    FINAL_NORM = "final_norm"
+    EMBEDDING = "embedding"
+    LM_HEAD = "lm_head"
+    ROTARY = "rotary_embedding"
 
 @dataclass
 class ExactCircuit:
@@ -60,6 +73,7 @@ class ExactCircuit:
     exact_hash: str
     memory_size: int
     bias: Optional[Dict[str, torch.Tensor]] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class ReasoningCache:
@@ -70,6 +84,7 @@ class ReasoningCache:
     total_memory: int
     exact_checksum: str
     model_spec: Dict[str, Any] = field(default_factory=dict)
+    creation_timestamp: float = field(default_factory=time.time)
 
 class ExactMemoryManager:
     """Manages exact memory operations for large models"""
@@ -79,36 +94,50 @@ class ExactMemoryManager:
         self.current_memory = 0
         self.lock = threading.Lock()
         self.temp_files = []
+        self.memory_allocations = {}
         
     def get_memory_usage(self) -> int:
         """Get current memory usage in bytes"""
         process = psutil.Process()
         return process.memory_info().rss
     
-    def allocate_memory(self, size: int) -> bool:
+    def allocate_memory(self, size: int, name: str = "unknown") -> bool:
         """Check if we can allocate memory"""
         with self.lock:
             projected = self.current_memory + size
             if projected < self.max_memory:
                 self.current_memory = projected
+                self.memory_allocations[name] = size
                 return True
             return False
     
-    def release_memory(self, size: int):
+    def release_memory(self, size: int, name: str = "unknown"):
         """Release memory allocation"""
         with self.lock:
             self.current_memory = max(0, self.current_memory - size)
+            if name in self.memory_allocations:
+                del self.memory_allocations[name]
     
     @contextmanager
-    def memory_context(self, size: int):
+    def memory_context(self, size: int, name: str = "unknown"):
         """Context manager for memory allocation"""
-        if self.allocate_memory(size):
+        if self.allocate_memory(size, name):
             try:
                 yield
             finally:
-                self.release_memory(size)
+                self.release_memory(size, name)
         else:
-            raise MemoryError(f"Cannot allocate {size} bytes")
+            raise MemoryError(f"Cannot allocate {size} bytes for {name}")
+            
+    def get_memory_info(self) -> Dict[str, Any]:
+        """Get memory usage information"""
+        with self.lock:
+            return {
+                "current_memory": self.current_memory,
+                "max_memory": self.max_memory,
+                "allocations": self.memory_allocations.copy(),
+                "usage_percentage": (self.current_memory / self.max_memory) * 100
+            }
             
     def cleanup(self):
         """Clean up temporary files"""
@@ -119,6 +148,7 @@ class ExactMemoryManager:
             except Exception as e:
                 logger.warning(f"Failed to remove temp file {file_path}: {e}")
         self.temp_files = []
+        self.memory_allocations.clear()
 
 class WeightLoader:
     """Efficient weight loading with memory mapping"""
@@ -136,13 +166,17 @@ class WeightLoader:
         
         for file_path in self.files:
             logger.info(f"Loading weights from {file_path}")
-            if file_path.suffix == '.safetensors':
-                file_weights = load_file(str(file_path), device='cpu')
-            else:
-                # Fallback to torch.load for .bin files
-                file_weights = torch.load(file_path, map_location='cpu', weights_only=True)
-            weights.update(file_weights)
-            
+            try:
+                if file_path.suffix == '.safetensors':
+                    file_weights = load_file(str(file_path), device='cpu')
+                else:
+                    # Fallback to torch.load for .bin files
+                    file_weights = torch.load(file_path, map_location='cpu', weights_only=True)
+                weights.update(file_weights)
+            except Exception as e:
+                logger.error(f"Failed to load weights from {file_path}: {e}")
+                raise
+                
         return weights
     
     def load_layer_weights(self, layer_idx: int, spec: Dict) -> Dict[str, torch.Tensor]:
@@ -151,32 +185,40 @@ class WeightLoader:
         layer_prefix = f"model.layers.{layer_idx}"
         
         for file_path in self.files:
-            if file_path.suffix == '.safetensors':
-                file_weights = load_file(str(file_path))
-            else:
-                file_weights = torch.load(file_path, map_location='cpu', weights_only=True)
-                
-            for name, weight in file_weights.items():
-                if name.startswith(layer_prefix):
-                    layer_weights[name] = weight
+            try:
+                if file_path.suffix == '.safetensors':
+                    file_weights = load_file(str(file_path))
+                else:
+                    file_weights = torch.load(file_path, map_location='cpu', weights_only=True)
+                    
+                for name, weight in file_weights.items():
+                    if name.startswith(layer_prefix):
+                        layer_weights[name] = weight
+            except Exception as e:
+                logger.error(f"Failed to load layer weights from {file_path}: {e}")
+                continue
         
         return layer_weights
     
-    def stream_weights(self, callback, chunk_size: int = 1000):
+    def stream_weights(self, callback: Callable, chunk_size: int = 1000):
         """Stream weights to avoid memory issues"""
         for file_path in self.files:
-            if file_path.suffix == '.safetensors':
-                weights = load_file(str(file_path))
-            else:
-                weights = torch.load(file_path, map_location='cpu', weights_only=True)
+            try:
+                if file_path.suffix == '.safetensors':
+                    weights = load_file(str(file_path))
+                else:
+                    weights = torch.load(file_path, map_location='cpu', weights_only=True)
+                    
+                items = list(weights.items())
                 
-            items = list(weights.items())
-            
-            for i in range(0, len(items), chunk_size):
-                chunk = dict(items[i:i+chunk_size])
-                callback(chunk)
-                del chunk
-                gc.collect()
+                for i in range(0, len(items), chunk_size):
+                    chunk = dict(items[i:i+chunk_size])
+                    callback(chunk)
+                    del chunk
+                    gc.collect()
+            except Exception as e:
+                logger.error(f"Failed to stream weights from {file_path}: {e}")
+                continue
 
 class ExactCircuitExtractor:
     """Extract exact reasoning circuits without approximation"""
@@ -264,7 +306,11 @@ class ExactCircuitExtractor:
                     output_shape=(None, None, self.spec['hidden_dim']),
                     exact_hash=exact_hash,
                     memory_size=memory_size,
-                    bias=bias_weights
+                    bias=bias_weights,
+                    metadata={
+                        'num_heads': self.spec.get('num_heads', 32),
+                        'head_dim': self.spec['hidden_dim'] // self.spec.get('num_heads', 32)
+                    }
                 )
                 
                 circuits[f'attention_{layer_idx}'] = circuit
@@ -316,7 +362,10 @@ class ExactCircuitExtractor:
                     output_shape=(None, None, self.spec['hidden_dim']),
                     exact_hash=exact_hash,
                     memory_size=memory_size,
-                    bias=bias_weights
+                    bias=bias_weights,
+                    metadata={
+                        'intermediate_size': self.spec.get('intermediate_size', 11008)
+                    }
                 )
                 
                 circuits[f'mlp_{layer_idx}'] = circuit
@@ -396,7 +445,7 @@ class ExactCircuitExtractor:
                     bias=bias_weights
                 )
                 
-                circuits[f'post_norm_{layer_idx}'] = circuit
+                circuits[f'post_norm_{layer_idx'] = circuit
         
         return circuits
     
@@ -884,6 +933,7 @@ class ExactRuntimeEngine:
         self.execution_order = self._determine_execution_order()
         self.weight_cache = {}
         self.bias_cache = {}
+        self.rotary_functions = {}
         
     def _determine_execution_order(self) -> List[str]:
         """Determine exact execution order using topological sort"""
@@ -921,7 +971,31 @@ class ExactRuntimeEngine:
         
         logger.info("Compiling exact computation functions...")
         
+        # First compile rotary functions if they exist
+        rotary_circuits = {k: v for k, v in self.cache.circuits.items() if k.startswith('rotary_')}
+        for name, circuit in rotary_circuits.items():
+            try:
+                code_str = circuit.computation_code.decode()
+                local_vars = {}
+                global_vars = {'torch': torch, 'math': math}
+                
+                exec(code_str, global_vars, local_vars)
+                
+                # Extract all functions from the compiled code
+                for key, value in local_vars.items():
+                    if callable(value):
+                        self.rotary_functions[key] = value
+                        logger.debug(f"Compiled rotary function: {key}")
+                        
+            except Exception as e:
+                logger.error(f"Failed to compile rotary function for {name}: {e}")
+                raise
+        
+        # Now compile all other functions
         for name, circuit in self.cache.circuits.items():
+            if name in rotary_circuits:
+                continue  # Skip rotary circuits as they're already compiled
+                
             try:
                 # Prepare the code with weight injection
                 code_str = circuit.computation_code.decode()
@@ -954,14 +1028,16 @@ class ExactRuntimeEngine:
                             f"bias_weights=runtime_engine.bias_cache.get('{bias_key}', None)"
                         )
                 
-                # Compile the function
-                local_vars = {'runtime_engine': self}
+                # Add rotary functions to global context if needed
                 global_vars = {
                     'torch': torch, 
                     'math': math,
                     'runtime_engine': self
                 }
+                global_vars.update(self.rotary_functions)
                 
+                # Compile the function
+                local_vars = {}
                 exec(code_str, global_vars, local_vars)
                 
                 # Find the compiled function
@@ -1064,9 +1140,10 @@ class ExactRuntimeEngine:
                     exact_output = self.forward_exact(test_input)
                     
                     # Check exact equality with tolerance
-                    if not torch.allclose(original_output, exact_output, atol=1e-4, rtol=1e-4):
+                    if not torch.allclose(original_output, exact_output, atol=1e-6, rtol=1e-6):
                         logger.error(f"Exactness verification failed for input {i}")
                         logger.error(f"Max difference: {torch.max(torch.abs(original_output - exact_output))}")
+                        logger.error(f"Mean difference: {torch.mean(torch.abs(original_output - exact_output))}")
                         return False
                     
                     logger.info(f"Exactness verified for test input {i}")
@@ -1088,21 +1165,32 @@ class ExactRuntimeEngine:
             _ = self.forward_exact(test_input)
         
         # Benchmark
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
-        times = []
-        for _ in range(num_runs):
-            start_time = time.time()
-            _ = self.forward_exact(test_input)
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            end_time = time.time()
-            times.append(end_time - start_time)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            times = []
+            for _ in range(num_runs):
+                start_event.record()
+                _ = self.forward_exact(test_input)
+                end_event.record()
+                torch.cuda.synchronize()
+                times.append(start_event.elapsed_time(end_event) / 1000.0)  # Convert to seconds
+        else:
+            times = []
+            for _ in range(num_runs):
+                start_time = time.time()
+                _ = self.forward_exact(test_input)
+                end_time = time.time()
+                times.append(end_time - start_time)
         
         return {
             'mean_time': np.mean(times),
             'std_time': np.std(times),
             'min_time': np.min(times),
             'max_time': np.max(times),
-            'throughput_tokens_per_second': test_input.numel() / np.mean(times)
+            'throughput_tokens_per_second': test_input.numel() / np.mean(times) if np.mean(times) > 0 else 0
         }
 
 class StudentModelAdapter:
@@ -1168,7 +1256,7 @@ class CompleteChimera:
         logger.info("Starting exact reasoning extraction...")
         
         # Load weights with memory management
-        with self.memory_manager.memory_context(2 * 1024**3):  # 2GB buffer
+        with self.memory_manager.memory_context(2 * 1024**3, "weight_loading"):  # 2GB buffer
             weights = self.weight_loader.load_all_weights()
             logger.info(f"Loaded {len(weights)} weight tensors")
         
@@ -1282,7 +1370,8 @@ class CompleteChimera:
                 'input_shape': circuit.input_shape,
                 'output_shape': circuit.output_shape,
                 'exact_hash': circuit.exact_hash,
-                'memory_size': circuit.memory_size
+                'memory_size': circuit.memory_size,
+                'metadata': circuit.metadata
             }
             serializable_data['circuits'][name] = serializable_circuit
         
@@ -1321,7 +1410,8 @@ class CompleteChimera:
                 output_shape=tuple(circuit_data['output_shape']),
                 exact_hash=circuit_data['exact_hash'],
                 memory_size=circuit_data['memory_size'],
-                bias=biases
+                bias=biases,
+                metadata=circuit_data.get('metadata', {})
             )
             circuits[name] = circuit
         
